@@ -144,6 +144,27 @@ get_driindex(void)
     return -ENOENT;
 }
 
+static drmModeModeInfo *
+connector_find_mode(drmModeConnector *connector, const char *mode_str, const unsigned int vrefresh)
+{
+    short i;
+    drmModeModeInfo *mode;
+    for (i = 0; i < connector->count_modes; i++) {
+        mode = &connector->modes[i];
+        if (!strcmp(mode->name, mode_str)) {
+            /* If the vertical refresh frequency is not specified, then return the first mode that matches by name.
+             * Otherwise, return the mode that matches the name and the specified vertical refresh frequency.
+             */
+            if (vrefresh == 0)
+                return mode;
+            else if (mode->vrefresh == vrefresh)
+                return mode;
+        }
+    }
+
+    return NULL;
+}
+
 /*********************************/
 /* Atomic helper functions block */
 /*********************************/
@@ -728,6 +749,11 @@ KMSDRM_VideoInit(_THIS)
     char devname[32];
     SDL_VideoDisplay display = {0};
 
+    const char *mode_line_override, *crtc_override, *mode_override, *p;
+    char *hint_video_mode = NULL;
+    unsigned short hint_vrefresh=0;
+    drmModeModeInfo *override_mode = NULL;
+
     dispdata = (SDL_DisplayData *) SDL_calloc(1, sizeof(SDL_DisplayData));
 
     if (!dispdata) {
@@ -754,6 +780,11 @@ KMSDRM_VideoInit(_THIS)
         ret = SDL_SetError("Couldn't create gbm device.");
         goto cleanup;
     }
+
+#ifdef DRM_CLIENT_CAP_ASPECT_RATIO
+    /* Expose aspect ratio flags to userspace if available */
+    KMSDRM_drmSetClientCap(viddata->drm_fd, DRM_CLIENT_CAP_ASPECT_RATIO, 1);
+#endif
 
     /* Get all of the available connectors / devices / crtcs */
     resources = KMSDRM_drmModeGetResources(viddata->drm_fd);
@@ -886,6 +917,46 @@ KMSDRM_VideoInit(_THIS)
 
        FIXME find first mode that specifies DRM_MODE_TYPE_PREFERRED */
     dispdata->mode = dispdata->crtc->mode;
+
+    /* See if any hints about the CRTCID/MODEID/MODELINE are set by the calling environment */
+    crtc_override = SDL_getenv("SDL_VIDEO_KMSDRM_CRTCID");
+    if (crtc_override) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,"Override KMS CRTCID hint received (SDL_VIDEO_KMSDRM_CRTCID)- %s", crtc_override);
+        dispdata->crtc_id = SDL_atoi(crtc_override);
+    }
+
+    mode_override = SDL_getenv("SDL_VIDEO_KMSDRM_MODEID");
+    if (mode_override) {
+        dispdata->mode = dispdata->connector->modes[SDL_atoi(mode_override)];
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "Override KMS ModeID received (SDL_VIDEO_KMSDRM_MODEID) - %s", mode_override);
+    }
+
+    mode_line_override = SDL_getenv("SDL_VIDEO_KMSDRM_MODELINE");
+    if (mode_line_override && !mode_override) {
+        /* Video mode override, formatted as WxH[@vRefresh] */
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "Override KMS video mode received (SDL_VIDEO_KMSDRM_MODELINE)- %s", mode_line_override);
+
+       p = strchr(mode_line_override, '@');
+       if (p == NULL) {
+           hint_video_mode =strdup(mode_line_override);
+       } else {
+           hint_video_mode = strndup(mode_line_override, (unsigned int)(p - mode_line_override));
+           hint_vrefresh = strtoul(p + 1, NULL, 10);
+       }
+
+       override_mode = connector_find_mode(dispdata->connector, hint_video_mode, hint_vrefresh);
+       if (override_mode) {
+            if ((*override_mode).hdisplay != dispdata->mode.hdisplay ||
+                (*override_mode).vdisplay != dispdata->mode.vdisplay ||
+                (*override_mode).vrefresh != dispdata->mode.vrefresh) {
+                    SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "Setting video mode to %dx%d @ %d",(*override_mode).hdisplay, (*override_mode).vdisplay, (*override_mode).vrefresh);
+                    dispdata->mode = (*override_mode);
+            }
+        } else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "Cannot find a suitable video mode on connector %d for mode %s, using default",
+                dispdata->connector->connector_id, mode_line_override);
+        }
+    }
 
     if (dispdata->crtc->mode_valid == 0) {
         SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
